@@ -1,0 +1,232 @@
+---
+title: "Survey Reweighting"
+output: html_notebook
+---
+
+This notebook contains code to reproduce the survey response analyses found in the paper "Don't Let Me Be Misunderstood: Comparing Intentions and Perceptions in Online Conversations" (WWW '20) by Jonathan P. Chang, Justin Cheng, and Cristian Danescu-Niculescu-Mizil.
+
+In this R notebook, we show how survey B (perceptions) was reweighted using post-stratification to match the population distribution of survey A (intentions).
+
+Notebook author: Justin Cheng (jcheng@fb.com)
+
+Additional thanks: Ryan S. Ritter for the original reweighting code
+
+Copyright (c) Facebook, Inc. and its affiliates.
+
+This source code is licensed under the MIT license found in the
+LICENSE file in the root directory of this source tree.
+
+```{r setup}
+knitr::opts_chunk$set(echo = T)
+knitr::opts_chunk$set(fig.width=8, fig.height=4.94)
+library(tidyverse)
+library(ggthemes)
+library(survey)
+```
+
+### Define functions for re-weighting
+
+```{r}
+# Define population strata
+get_pop_groups <- function(pop_data) {
+  pop_groups <- pop_data %>%
+    filter(gender %in% c("1", "2") & !is.na(age)) %>%
+    mutate(
+      age_strata = ifelse(age <= 17, "13_17",
+                   ifelse(age <= 24, "18_24",
+                   ifelse(age <= 44, "25_44",
+                   ifelse(age <= 64, "45_64", "65_plus")))),
+      overall_strata = paste(gender, age_strata, sep="_")
+    ) %>%
+    group_by(overall_strata) %>%
+    summarise(
+      n = n()
+    ) %>%
+    ungroup() %>%
+    mutate(
+      total = sum(as.numeric(n)),
+      proportion = n / total
+    ) %>%
+    dplyr::select(
+      overall_strata,
+      proportion
+    )
+  return(pop_groups)
+}
+
+# Define survey strata
+get_df_with_groups <- function(df) {
+  df_with_groups <- df %>%
+    filter(gender %in% c("1", "2") & !is.na(age)) %>%
+    mutate(
+      age_strata = ifelse(age <= 17, "13_17",
+                   ifelse(age <= 24, "18_24",
+                   ifelse(age <= 44, "25_44",
+                   ifelse(age <= 64, "45_64", "65_plus")))),
+      overall_strata = paste(gender, age_strata, sep="_")
+    ) %>%
+    dplyr::select(
+      info_seeking,
+      info_giving,
+      opinion_seeking,
+      opinion_giving,
+      joking,
+      overall_strata
+    ) %>%
+    na.omit()
+  return(df_with_groups)
+}
+
+# Make sure that all strata in the survey data are in the population sample
+check_strata <- function(pop_groups, df_with_groups) {
+  print(paste("# Strata for Sample:", length(table(df_with_groups$overall_strata)), " / # for Population Data:", length(table(pop_groups$overall_strata))))
+
+  stopifnot(length(names(table(df_with_groups$overall_strata))[!names(table(df_with_groups$overall_strata)) %in% names(table(pop_groups$overall_strata))]) == 0)
+}
+
+# Plot actual vs. expected distribution
+plot_group_comparison <- function(pop_groups, df_with_groups, text_size) {
+  actual <- as.data.frame(
+    prop.table(
+      table(df_with_groups$overall_strata)
+    )
+  ) %>%
+    dplyr::select(
+      overall_strata = Var1,
+      proportion = Freq
+    ) %>%
+    mutate(
+      distribution = "actual"
+    )
+
+  expected <- pop_groups %>%
+    dplyr::select(
+      overall_strata,
+      proportion
+    ) %>%
+    mutate(
+      distribution = "expected"
+    )
+
+  comparison <- rbind(actual, expected)
+
+  comparison %>%
+    ggplot(aes(x = overall_strata, y = proportion, fill = distribution)) +
+    geom_bar(stat = "identity", position=position_dodge(.5)) +
+    labs(title = "Actual vs. Expected Distribution", x=NULL, y="Proportion") +
+    theme_few() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size=text_size))
+}
+
+# Reweight sample based on population using post-stratification
+get_stratification <- function(pop_groups, df_with_groups) {
+  # Create population frequencies
+  n.sample <- df_with_groups %>% summarise(n.sample = n())
+  pop_strata <- merge(pop_groups, n.sample) %>%
+    mutate(
+      # Make sure that Frequency is at least 1 if proportion is > 0
+      Freq = ifelse(proportion > 0, pmax(round(proportion * n.sample, 0), 1), 0)
+      # Freq = ceiling(proportion * n.sample)
+    ) %>%
+    dplyr::select(overall_strata, Freq)
+
+  has_partial <- length(table(df_with_groups$overall_strata)) != length(table(pop_groups$overall_strata))
+
+  # Stratify
+  df_with_groups.unweighted <- svydesign(ids = ~1, data = df_with_groups)
+  df_with_groups.post.stratified <- postStratify(
+    design = df_with_groups.unweighted,  # this is our unweighted survey design object
+    strata = ~overall_strata, # variable in sample to weight on
+    population = pop_strata, # variable in population use to reweight sample
+    partial = has_partial # set this to FALSE to enforce that no empty strata exist
+  )
+
+  # Check weights and trim
+  wts <- weights(df_with_groups.post.stratified)
+  wts_before <- data.frame(
+    category = "Before Trimming",
+    min = min(wts),
+    q1 = quantile(wts, 0.25),
+    med = quantile(wts, 0.5),
+    mean = mean(wts),
+    q3 = quantile(wts, 0.75),
+    max = max(wts)
+  )
+  
+  df_with_groups.post.stratified <- trimWeights(df_with_groups.post.stratified, lower=0.3, upper=5, strict = TRUE)
+  wts <- weights(df_with_groups.post.stratified)
+  wts_after <- data.frame(
+    category = "After Trimming",
+    min = min(wts),
+    q1 = quantile(wts, 0.25),
+    med = quantile(wts, 0.5),
+    mean = mean(wts),
+    q3 = quantile(wts, 0.75),
+    max = max(wts)
+  )
+  wts_all <- rbind(wts_before, wts_after)
+  rownames(wts_all) <- NULL
+  print(wts_all)
+
+  return(df_with_groups.post.stratified)
+}
+```
+
+### Reweight survey B based on the population distribution in survey A
+
+```{r}
+df1 <- read.table("survey_a_responses_cached_notext.tsv", sep = "\t", header=T)
+df2 <- read.table("survey_b_responses_cached_notext.tsv", sep = "\t", header=T)
+pop_groups <- get_pop_groups(df1)
+df_groups <- get_df_with_groups(df2)
+check_strata(pop_groups, df_groups)
+plot_group_comparison(pop_groups, df_groups, 12)
+df_groups.post.stratified <- get_stratification(pop_groups, df_groups)
+```
+
+### Recover reweighted distribution
+
+```{r}
+all_weights <- c()
+
+for (goal in c("joking", "info_giving", "info_seeking", "opinion_giving", "opinion_seeking")) {
+  # Use svyquantile to recover the reweighted distribution for plotting (and comparison)
+  # Change the below to seq(0,1,.001) and table(x$quantiles) / 1000 for increased precision
+  x <- svyquantile(as.formula(paste0("~", goal)), design=df_groups.post.stratified, seq(0,1,.005), ci=TRUE)
+  y_df2 <- table(x$quantiles) / 200
+  y_df1 <- table(df1[,goal]) / sum(!is.na(df1[,goal]))
+  
+  all_weights <- rbind(
+    all_weights,
+    data.frame(y_df2) %>%
+      mutate(category = "perception", goal = goal),
+    data.frame(y_df1) %>%
+      mutate(category = "intention", goal = goal)
+  )
+}
+```
+
+### Plot distribution of reweighted survey responses
+
+```{r}
+all_weights %>%
+  ggplot(aes(x = Var1, y = Freq, group = category, fill = category)) +
+  facet_grid(. ~ goal) +
+  geom_bar(stat = "identity", position = "dodge")
+```
+
+### Get means for each goal for each survey
+
+```{r}
+all_weights %>%
+  group_by(category, goal) %>%
+  summarise(
+    avg = round(sum(as.numeric(Var1) * Freq), 2)
+  )
+```
+
+### Write results to file
+
+```{r}
+# write.table(all_weights, file = "survey_a_b_reweighted.tsv", sep = "\t", quote=F, row.names = F)
+```
